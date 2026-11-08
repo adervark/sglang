@@ -6,6 +6,7 @@ LMCache owns external storage; retrieved KV is published after reaching GPU.
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import logging
 from array import array
 from typing import TYPE_CHECKING, Any, Optional
@@ -111,14 +112,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             and flow.load is None
         ):
             # Use the shortest cross-rank L1 prefix for consistent admission.
-            params = MatchPrefixParams(
-                key=params.key[: flow.local_hit_tokens],
-                cow_mamba=params.cow_mamba,
-                req=req,
+            params = dataclasses.replace(
+                params, key=params.key[: flow.local_hit_tokens]
             )
         elif flow is not None and flow.load is not None and params.cow_mamba:
             # Re-arm Mamba COW from the retrieved checkpoint on retry.
-            self._arm_external_mamba_cow(flow, req)
+            self._arm_external_mamba_cow(flow, req, take_slot=not params.defer_cow_slot)
             params = MatchPrefixParams(key=params.key, cow_mamba=False, req=req)
         result = super().match_prefix(params)
         if req is None:
@@ -458,12 +457,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.lmcache_connector.reset_mamba_checkpoint_metadata(physical)
         return slot
 
-    def _arm_external_mamba_cow(self, flow: LMCacheExternalFlow, req: Req) -> None:
-        """Give a request a mutable state slot and COW from the loaded checkpoint."""
+    def _arm_external_mamba_cow(
+        self, flow: LMCacheExternalFlow, req: Req, *, take_slot: bool = True
+    ) -> None:
+        """Give a request a mutable state slot and COW from the loaded checkpoint.
+        Without ``take_slot``, a request holding none gets its own with its row."""
         checkpoint = flow.mamba_value
         if checkpoint is None:
             return
-        if req.kv.mamba_pool_idx is None:
+        if req.kv.mamba_pool_idx is None and not take_slot:
+            flow.request_mamba_value = None
+            flow.allocated_request_mamba_for_load = False
+        elif req.kv.mamba_pool_idx is None:
             active = self._allocate_external_mamba_slot()
             assert active is not None, "Cannot allocate Mamba request state for LMCache"
             req.kv.mamba_pool_idx = active[0]
